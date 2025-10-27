@@ -1,0 +1,28 @@
+name: refresh-rtracker
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes
+  workflow_dispatch:
+
+jobs:
+  refresh-rtracker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call internal refresh
+        env:
+          DEPLOY_URL: ${{ secrets.DEPLOY_URL }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+        run: |
+          if [ -z "$DEPLOY_URL" ] || [ -z "$REFRESH_TOKEN" ]; then
+            echo "Missing DEPLOY_URL or REFRESH_TOKEN secrets"
+            exit 1
+          fi
+          echo "Posting to ${DEPLOY_URL}/internal/refresh"
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${REFRESH_TOKEN}" \
+            "${DEPLOY_URL}/internal/refresh")
+          echo "HTTP code: $http_code"
+          if [ "$http_code" != "200" ]; then
+            echo "Refresh endpoint returned non-OK: $http_code"
+            exit 1
+          fi
