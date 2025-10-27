@@ -1,9 +1,15 @@
+#!/usr/bin/env python3
 # app.py
 # Full modified Refund Tracker application (safe for serverless).
-# Changes:
-# - DATA_DIR defaults to /tmp/data (writable on serverless) and is NOT created at import time.
-# - save_cache_for_source() creates DATA_DIR lazily and handles read-only filesystem gracefully.
-# - Rest of the original parsing/search logic preserved.
+# Changes implemented:
+# - Prefer prebuilt JSON cache from GitHub raw (GITHUB_RAW_BASE) for fast reads.
+# - Fallback to local data/*.json (committed by GitHub Actions) if GitHub raw not configured or unavailable.
+# - If no prebuilt data available, avoid doing heavy CSV fetching on request (returns empty set and logs warning).
+# - Added load_cache_for_source(), load_all_from_github_raw(), load_all_from_local(), get_all_records()
+# - search() now uses get_all_records() instead of fetch_all_sources() to avoid blocking remote CSV fetches on user requests.
+# - Internal refresh endpoint still calls fetch_all_sources() so your scheduled job (GitHub Actions or manual) can rebuild caches.
+# NOTE: Set env GITHUB_RAW_BASE to e.g. "https://raw.githubusercontent.com/<owner>/<repo>/main/data"
+#       and run the provided GitHub Actions updater to populate data/all.json for fast production reads.
 
 from flask import Flask, render_template, request, jsonify
 import requests
@@ -73,8 +79,14 @@ REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "600"))  # seconds between 
 DISABLE_BACKGROUND_SYNC = os.getenv("DISABLE_BACKGROUND_SYNC", "0") == "1"  # set to "1" on serverless
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 
+# GitHub raw base (optional) for fast prebuilt data
+# e.g. https://raw.githubusercontent.com/<owner>/<repo>/main/data
+GITHUB_RAW_BASE = os.getenv("GITHUB_RAW_BASE", "").rstrip("/")
+INMEM_CACHE_TTL = int(os.getenv("INMEM_CACHE_TTL", "600"))
+
 # logging
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # Header mapping and helpers (same as your original parsing logic)
@@ -279,6 +291,38 @@ def save_cache_for_source(source_name, csv_text, records):
     except Exception as ex:
         logger.warning("Failed to write JSON cache for %s: %s", source_name, ex)
 
+# -- New: load cache from local JSON/CSV (used by fetch_source_if_needed & by get_all_records) --
+def load_cache_for_source(source_name):
+    """
+    Load cached records for a given source. Prefer JSON cache if present, else CSV cache.
+    """
+    csv_path, json_path = cache_paths_for_source(source_name)
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as jf:
+                records = json.load(jf)
+                # restore derived fields
+                for rec in records:
+                    rec.setdefault("wallet_number_normalized", re.sub(r"\D", "", rec.get("wallet_number", "")))
+                    rec.setdefault("order_number_norm", (rec.get("order_number", "") or "").upper())
+                    rec.setdefault("sellerorderno_norm", (rec.get("sellerorderno", "") or "").upper())
+                    rec.setdefault("transaction_id_norm", (rec.get("transaction_id", "") or "").upper())
+                    rec.setdefault("source", source_name)
+                    dt = try_parse_date(rec.get("date", "") or rec.get("date_fmt", ""))
+                    rec["date_obj"] = dt
+                    rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date", ""))
+                return records
+        except Exception as ex:
+            logger.warning("Failed to load JSON cache for %s: %s", source_name, ex)
+    if csv_path.exists():
+        try:
+            text = csv_path.read_text(encoding="utf-8", errors="replace")
+            return parse_csv_content(text, source_name)
+        except Exception as ex:
+            logger.warning("Failed to parse CSV cache for %s: %s", source_name, ex)
+    return []
+
+# Background refresh pool and guard
 _REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _refresh_in_progress = set()
 _refresh_lock = threading.Lock()
@@ -453,6 +497,87 @@ def get_cache_mtime(source_name):
         return csv_path.stat().st_mtime
     return None
 
+# --- New: GitHub raw & local combined loader for fast reads ---
+_inmem_all = None
+_inmem_all_at = 0.0
+
+def load_all_from_github_raw():
+    """
+    Attempt to load data/all.json from GitHub raw URL (fast CDN). Cache in memory for INMEM_CACHE_TTL.
+    """
+    global _inmem_all, _inmem_all_at
+    if not GITHUB_RAW_BASE:
+        return None
+    now = time.time()
+    if _inmem_all is not None and (now - _inmem_all_at) < INMEM_CACHE_TTL:
+        return _inmem_all
+    url = f"{GITHUB_RAW_BASE}/all.json"
+    try:
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            # restore derived fields if missing
+            for rec in data:
+                rec.setdefault("wallet_number_normalized", re.sub(r"\D", "", rec.get("wallet_number", "")))
+                rec.setdefault("order_number_norm", (rec.get("order_number", "") or "").upper())
+                rec.setdefault("sellerorderno_norm", (rec.get("sellerorderno", "") or "").upper())
+                rec.setdefault("transaction_id_norm", (rec.get("transaction_id", "") or "").upper())
+                rec.setdefault("source", rec.get("source", "Unknown"))
+                dt = try_parse_date(rec.get("date", "") or rec.get("date_fmt", ""))
+                rec["date_obj"] = dt
+                rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date", ""))
+            _inmem_all = data
+            _inmem_all_at = time.time()
+            logger.info("Loaded all.json from GitHub raw (%d records)", len(data))
+            return data
+    except Exception as e:
+        logger.warning("Failed to load all.json from GitHub raw: %s", e)
+    return None
+
+def load_all_from_local():
+    """
+    Try to load data/all.json from local repo (exists if committed).
+    """
+    p = Path("data") / "all.json"
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for rec in data:
+                rec.setdefault("wallet_number_normalized", re.sub(r"\D", "", rec.get("wallet_number", "")))
+                rec.setdefault("order_number_norm", (rec.get("order_number", "") or "").upper())
+                rec.setdefault("sellerorderno_norm", (rec.get("sellerorderno", "") or "").upper())
+                rec.setdefault("transaction_id_norm", (rec.get("transaction_id", "") or "").upper())
+                rec.setdefault("source", rec.get("source", "Unknown"))
+                dt = try_parse_date(rec.get("date", "") or rec.get("date_fmt", ""))
+                rec["date_obj"] = dt
+                rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date", ""))
+            logger.info("Loaded all.json from local data (size=%d)", len(data))
+            return data
+    except Exception as e:
+        logger.warning("Failed to load local all.json: %s", e)
+    return None
+
+def get_all_records():
+    """
+    Preferred order:
+     1) GitHub raw all.json (fast CDN)
+     2) local data/all.json (if present)
+     3) fallback: return empty list (do not do heavy fetch on request)
+    """
+    data = load_all_from_github_raw()
+    if data is not None:
+        return data
+    data = load_all_from_local()
+    if data is not None:
+        return data
+    # No prebuilt data available; avoid doing heavy fetches on request. Return empty list.
+    logger.warning("No prebuilt all.json available (github raw/local). Returning empty dataset. Use GitHub Actions updater to populate data/all.json.")
+    return []
+
 # --- routes ---
 
 @app.route("/", methods=["GET"])
@@ -470,9 +595,10 @@ def search():
     if not query:
         return render_template("results.html", found=False, message="Please enter a search query.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
 
-    records = fetch_all_sources()
+    # Use prebuilt combined records (fast). Do NOT perform blocking CSV fetches here.
+    records = get_all_records()
     if not records:
-        return render_template("results.html", found=False, message="No data available from any source.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
+        return render_template("results.html", found=False, message="No data available from any source. Try again later.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
 
     detected_type, matches = search_smarter(records, query)
     if not matches:
