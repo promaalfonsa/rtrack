@@ -549,6 +549,118 @@ def search_route():
         grouped_results.append({"order_number":k,"records":recs,"count":len(recs),"sources":srcs})
     return render_template("results.html", found=True, results=matches, query=query, grouped_results=grouped_results, source_names=list(SOURCES.keys()))
 
+# Add these helper + route to your existing app.py (insert anywhere with your other routes)
+# This implements the /sources endpoint expected by templates and fixes the BuildError.
+from collections import OrderedDict
+
+def get_cache_mtime(source_name):
+    """
+    Return mtime of the CSV cache for a given source, or None.
+    """
+    try:
+        csv_path, _ = cache_paths_for_source(source_name)
+        if csv_path.exists():
+            return csv_path.stat().st_mtime
+    except Exception:
+        return None
+    return None
+
+@app.route("/sources", methods=["GET"])
+def sources_view():
+    """
+    Serve a page that shows per-source grouped results.
+    - If ?query= is present, search only the active source.
+    - Otherwise show grouped lists for all sources.
+    """
+    source_names = list(SOURCES.keys())
+    if not source_names:
+        return render_template("sources.html", grouped_by_source={}, source_names=[], active_source=None, last_updated={})
+
+    active = request.args.get("source") or source_names[0]
+    query = request.args.get("query", "").strip()
+
+    # If a query is provided, do a server-side search limited to the selected source
+    if query:
+        recs = fetch_source_if_needed(active, SOURCES[active])
+        _, matches = search_smarter(recs, query)
+
+        def sort_key_record(r):
+            dt = r.get("date_obj")
+            return dt.timestamp() if dt else 0
+
+        matches_sorted = sorted(matches, key=sort_key_record, reverse=True)
+
+        groups = OrderedDict()
+        for r in matches_sorted:
+            key = r.get("order_number_norm") or r.get("order_number") or "UNKNOWN"
+            groups.setdefault(key, []).append(r)
+
+        group_items = []
+        for k, recs_group in groups.items():
+            dates = [r.get("date_obj").timestamp() for r in recs_group if r.get("date_obj")]
+            group_ts = max(dates) if dates else 0
+            group_items.append((k, recs_group, group_ts))
+        group_items_sorted = sorted(group_items, key=lambda x: x[2], reverse=True)
+
+        grouped_results = []
+        for k, recs_group, ts in group_items_sorted:
+            grouped_results.append({
+                "order_number": k,
+                "records": recs_group,
+                "count": len(recs_group),
+            })
+
+        last_updated = {active: get_cache_mtime(active)}
+        return render_template("sources.html",
+                               grouped_by_source={active: grouped_results},
+                               source_names=source_names,
+                               active_source=active,
+                               last_updated=last_updated,
+                               query=query)
+
+    # No query — show grouped results for all sources
+    grouped_by_source = OrderedDict()
+    last_updated = {}
+    for source_name in source_names:
+        recs = fetch_source_if_needed(source_name, SOURCES[source_name])
+        # ensure date fields exist
+        for r in recs:
+            if "date_fmt" not in r or not r.get("date_fmt"):
+                dt = try_parse_date(r.get("date", ""))
+                r["date_obj"] = dt
+                r["date_fmt"] = format_date_for_ui(dt) if dt else r.get("date", "")
+
+        # group by order_number (normalized)
+        groups = OrderedDict()
+        recs_sorted = sorted(recs, key=lambda x: x.get("date_obj").timestamp() if x.get("date_obj") else 0, reverse=True)
+        for r in recs_sorted:
+            key = r.get("order_number_norm") or r.get("order_number") or "UNKNOWN"
+            groups.setdefault(key, []).append(r)
+
+        group_items = []
+        for k, rec_list in groups.items():
+            dates = [rr.get("date_obj").timestamp() for rr in rec_list if rr.get("date_obj")]
+            group_ts = max(dates) if dates else 0
+            group_items.append((k, rec_list, group_ts))
+        group_items_sorted = sorted(group_items, key=lambda x: x[2], reverse=True)
+
+        group_dicts = []
+        for k, rec_list, ts in group_items_sorted:
+            group_dicts.append({
+                "order_number": k,
+                "records": rec_list,
+                "count": len(rec_list),
+            })
+
+        grouped_by_source[source_name] = group_dicts
+        last_updated[source_name] = get_cache_mtime(source_name)
+
+    return render_template("sources.html",
+                           grouped_by_source=grouped_by_source,
+                           source_names=source_names,
+                           active_source=active,
+                           last_updated=last_updated)
+
 @app.route("/internal/refresh", methods=["POST"])
 def internal_refresh():
     if CRON_SECRET:
