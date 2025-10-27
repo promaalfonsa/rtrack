@@ -48,9 +48,9 @@ REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "600"))
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 # GitHub API / data branch config (for private repo)
-GITHUB_API_TOKEN = os.getenv("GITHUB_API_TOKEN", "")   # required for private repo access at runtime
-GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")          # e.g. promaalfonsa
-GITHUB_REPO = os.getenv("GITHUB_REPO", "")            # e.g. rtrack
+GITHUB_API_TOKEN = os.getenv("GITHUB_API_TOKEN", "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")   # required for private repo access at runtime
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "promaalfonsa")          # e.g. promaalfonsa
+GITHUB_REPO = os.getenv("GITHUB_REPO", "rtrack")            # e.g. rtrack
 GITHUB_DATA_BRANCH = os.getenv("GITHUB_DATA_BRANCH", "data-updates")
 INMEM_CACHE_TTL = int(os.getenv("INMEM_CACHE_TTL", "600"))
 
