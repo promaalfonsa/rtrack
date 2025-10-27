@@ -19,6 +19,8 @@ from pathlib import Path
 from collections import defaultdict, OrderedDict
 from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
