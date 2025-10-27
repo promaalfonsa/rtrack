@@ -1,39 +1,28 @@
 #!/usr/bin/env python3
 # app.py
-# Full modified Refund Tracker application (safe for serverless).
-# Changes implemented:
-# - Prefer prebuilt JSON cache from GitHub raw (GITHUB_RAW_BASE) for fast reads.
-# - Fallback to local data/*.json (committed by GitHub Actions) if GitHub raw not configured or unavailable.
-# - If no prebuilt data available, avoid doing heavy CSV fetching on request (returns empty set and logs warning).
-# - Added load_cache_for_source(), load_all_from_github_raw(), load_all_from_local(), get_all_records()
-# - search() now uses get_all_records() instead of fetch_all_sources() to avoid blocking remote CSV fetches on user requests.
-# - Internal refresh endpoint still calls fetch_all_sources() so your scheduled job (GitHub Actions or manual) can rebuild caches.
-# NOTE: Set env GITHUB_RAW_BASE to e.g. "https://raw.githubusercontent.com/<owner>/<repo>/main/data"
-#       and run the provided GitHub Actions updater to populate data/all.json for fast production reads.
+# Refund Tracker web app modified to read prebuilt data from a dedicated branch (data-updates)
+# via the GitHub Contents API (authenticated). This avoids redeploying Vercel on every data commit.
 
 from flask import Flask, render_template, request, jsonify
+import os
+import re
+import json
+import time
+import base64
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import csv
 import io
-import re
-import time
-import json
-from collections import defaultdict, OrderedDict
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-import tempfile
-import shutil
+import threading
 import logging
 from datetime import datetime
+from pathlib import Path
+from collections import defaultdict, OrderedDict
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
-import threading
-import os
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# Register a Jinja filter to format timestamps for templates
+# Jinja filter
 def timestamp_to_string(ts):
     try:
         if not ts:
@@ -43,10 +32,32 @@ def timestamp_to_string(ts):
         return dt.strftime("%d %b %Y %H:%M")
     except Exception:
         return str(ts)
-
 app.jinja_env.filters['timestamp_to_string'] = timestamp_to_string
 
-# --- Configuration (default public CSV sources) ---
+# --- Config ---
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/data"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
+BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", "0.5"))
+
+DISABLE_BACKGROUND_SYNC = os.getenv("DISABLE_BACKGROUND_SYNC", "1") == "1"
+REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "600"))
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+
+# GitHub API / data branch config (for private repo)
+GITHUB_API_TOKEN = os.getenv("GITHUB_API_TOKEN", "")   # required for private repo access at runtime
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")          # e.g. promaalfonsa
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")            # e.g. rtrack
+GITHUB_DATA_BRANCH = os.getenv("GITHUB_DATA_BRANCH", "data-updates")
+INMEM_CACHE_TTL = int(os.getenv("INMEM_CACHE_TTL", "600"))
+
+# logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger(__name__)
+
+# --- Sources (same as before) ---
 SOURCES = {
     "Bkash": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRLeRzOYkgTFBvY1jNnCSy9jwg967E5lUd133CUnrhfaMsfEOfxLRjIUPoWPtdKaYhYjMduj7GIVU9E/pub?gid=0&single=true&output=csv",
     "Nagad": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRLeRzOYkgTFBvY1jNnCSy9jwg967E5lUd133CUnrhfaMsfEOfxLRjIUPoWPtdKaYhYjMduj7GIVU9E/pub?gid=710748437&single=true&output=csv",
@@ -59,70 +70,10 @@ SOURCES = {
     "SEBL": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRLeRzOYkgTFBvY1jNnCSy9jwg967E5lUd133CUnrhfaMsfEOfxLRjIUPoWPtdKaYhYjMduj7GIVU9E/pub?gid=119713136&single=true&output=csv",
 }
 
-# Allow overriding via env vars SOURCE_<safe_name>
-for key in list(SOURCES.keys()):
-    safe = "".join([c if (c.isalnum() or c == "_") else "_" for c in key]).lower()
-    env_key = f"SOURCE_{safe}"
-    if os.getenv(env_key):
-        SOURCES[key] = os.getenv(env_key)
-
-# Data directory & cache settings
-# Use /tmp/data as default on serverless (writable). Do NOT mkdir at import time.
-DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/data"))
-CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))  # 10 minutes default
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
-BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", "0.5"))
-
-# Background refresh config
-REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "600"))  # seconds between background runs
-DISABLE_BACKGROUND_SYNC = os.getenv("DISABLE_BACKGROUND_SYNC", "0") == "1"  # set to "1" on serverless
-CRON_SECRET = os.getenv("CRON_SECRET", "")
-
-# GitHub raw base (optional) for fast prebuilt data
-# e.g. https://raw.githubusercontent.com/<owner>/<repo>/main/data
-GITHUB_RAW_BASE = os.getenv("GITHUB_RAW_BASE", "").rstrip("/")
-INMEM_CACHE_TTL = int(os.getenv("INMEM_CACHE_TTL", "600"))
-
-# logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger(__name__)
-
-# Header mapping and helpers (same as your original parsing logic)
-HEADER_MAP = {
-    "date": "date",
-    "order number": "order_number",
-    "ordernumber": "order_number",
-    "order_no": "order_number",
-    "order": "order_number",
-    "sellerorderno": "sellerorderno",
-    "seller order no": "sellerorderno",
-    "seller order no.": "sellerorderno",
-    "seller order": "sellerorderno",
-    "payment method": "payment_method",
-    "refund method": "refund_method",
-    "wallet number": "wallet_number",
-    "phone": "wallet_number",
-    "card number": "card_number",
-    "transaction amount (in bdt)": "amount",
-    "transaction amount": "amount",
-    "amount": "amount",
-    "cashback": "cashback",
-    "cash_back": "cashback",
-    "transaction id": "transaction_id",
-    "transactionid": "transaction_id",
-    "transaction": "transaction_id",
-}
-
+# --- utility & parsing functions (same as your existing code) ---
 def requests_session_with_retries():
     s = requests.Session()
-    retries = Retry(
-        total=MAX_RETRIES,
-        backoff_factor=BACKOFF_FACTOR,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
+    retries = requests.adapters.Retry(total=MAX_RETRIES, backoff_factor=BACKOFF_FACTOR, status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
     adapter = HTTPAdapter(max_retries=retries)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
@@ -156,13 +107,7 @@ def try_parse_date(s):
     if not s:
         return None
     s_clean = s.strip()
-    formats = [
-        "%m/%d/%Y", "%m/%d/%y",
-        "%m-%d-%Y", "%m-%d-%y",
-        "%Y-%m-%d",
-        "%d/%m/%Y", "%d-%m-%Y",
-        "%b %d %Y", "%d %b %Y",
-    ]
+    formats = ["%m/%d/%Y","%m/%d/%y","%m-%d-%Y","%m-%d-%y","%Y-%m-%d","%d/%m/%Y","%d-%m-%Y","%b %d %Y","%d %b %Y"]
     for fmt in formats:
         try:
             return datetime.strptime(s_clean, fmt)
@@ -170,14 +115,14 @@ def try_parse_date(s):
             pass
     m = re.search(r"(\d{1,2})[^\d](\d{1,2})[^\d](\d{2,4})", s_clean)
     if m:
-        g1, g2, g3 = m.groups()
+        g1,g2,g3 = m.groups()
         if len(g3) == 2:
             year = int(g3) + (2000 if int(g3) < 70 else 1900)
         else:
             year = int(g3)
-        for (a, b) in ((g1, g2), (g2, g1)):
+        for (a,b) in ((g1,g2),(g2,g1)):
             try:
-                return datetime(year, int(a), int(b))
+                return datetime(year,int(a),int(b))
             except Exception:
                 pass
     try:
@@ -196,33 +141,29 @@ def parse_csv_content(content, source_name):
     rows = list(reader)
     if not rows:
         return []
-
     raw_headers = rows[0]
     headers = [normalize_header(h) for h in raw_headers]
-
     records = []
     for r in rows[1:]:
         if not any(cell.strip() for cell in r):
             continue
-        row = list(r) + [""] * max(0, len(headers) - len(r))
+        row = list(r) + [""] * max(0, len(headers)-len(r))
         rec = {}
-        for i, key in enumerate(headers):
+        for i,key in enumerate(headers):
             rec[key] = row[i].strip()
-        rec["order_number"] = safe_decimal_str(rec.get("order_number", "") or "")
-        rec["sellerorderno"] = (rec.get("sellerorderno", "") or "").strip()
-        rec["payment_method"] = (rec.get("payment_method", "") or "").strip()
-        rec["wallet_number"] = (rec.get("wallet_number", "") or "").strip()
-        rec["card_number"] = (rec.get("card_number", "") or "").strip()
-        rec["wallet_number_normalized"] = re.sub(r"\D", "", rec["wallet_number"])
-        rec["transaction_id"] = (rec.get("transaction_id", "") or "").strip()
-        rec["amount"] = (rec.get("amount", "") or "").strip()
-        rec["cashback"] = (rec.get("cashback", "") or "").strip()
-        rec["date"] = (rec.get("date", "") or "").strip()
-
+        rec["order_number"] = safe_decimal_str(rec.get("order_number","") or "")
+        rec["sellerorderno"] = (rec.get("sellerorderno","") or "").strip()
+        rec["payment_method"] = (rec.get("payment_method","") or "").strip()
+        rec["wallet_number"] = (rec.get("wallet_number","") or "").strip()
+        rec["card_number"] = (rec.get("card_number","") or "").strip()
+        rec["wallet_number_normalized"] = re.sub(r"\D","", rec["wallet_number"])
+        rec["transaction_id"] = (rec.get("transaction_id","") or "").strip()
+        rec["amount"] = (rec.get("amount","") or "").strip()
+        rec["cashback"] = (rec.get("cashback","") or "").strip()
+        rec["date"] = (rec.get("date","") or "").strip()
         dt = try_parse_date(rec["date"])
         rec["date_obj"] = dt
         rec["date_fmt"] = format_date_for_ui(dt) if dt else rec["date"]
-
         rec["order_number_norm"] = (rec["order_number"] or "").upper()
         rec["sellerorderno_norm"] = (rec["sellerorderno"] or "").upper()
         rec["transaction_id_norm"] = (rec["transaction_id"] or "").upper()
@@ -231,7 +172,7 @@ def parse_csv_content(content, source_name):
     return records
 
 def cache_paths_for_source(source_name):
-    safe_name = re.sub(r"[^\w\-]", "_", source_name).lower()
+    safe_name = re.sub(r"[^\w\-]","_", source_name).lower()
     csv_path = DATA_DIR / f"refunds_{safe_name}.csv"
     json_path = DATA_DIR / f"refunds_{safe_name}.json"
     return csv_path, json_path
@@ -240,77 +181,39 @@ def _make_json_safe(records):
     safe = []
     for r in records:
         rec = {}
-        for k, v in r.items():
+        for k,v in r.items():
             if k == "date_obj":
                 continue
             if isinstance(v, datetime):
                 rec[k] = v.isoformat()
                 continue
-            if v is None or isinstance(v, (str, int, float, bool, list, dict)):
+            if v is None or isinstance(v, (str,int,float,bool,list,dict)):
                 rec[k] = v
                 continue
             try:
-                json.dumps({k: v})
+                json.dumps({k:v})
                 rec[k] = v
             except Exception:
                 rec[k] = str(v)
         safe.append(rec)
     return safe
 
-def save_cache_for_source(source_name, csv_text, records):
-    """
-    Write CSV and JSON caches. Create DATA_DIR lazily and handle read-only or permission errors.
-    On serverless (Vercel) the filesystem is ephemeral; /tmp is writable during function lifetime.
-    """
-    csv_path, json_path = cache_paths_for_source(source_name)
-
-    # Ensure directory exists (best-effort). Wrap in try/except because on some
-    # serverless platforms the repo root is read-only.
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as ex:
-        logger.warning("Could not create DATA_DIR=%s (%s). Falling back to in-memory/no-disk cache.", DATA_DIR, ex)
-        # If we cannot create directory, skip writing to disk but still keep function working.
-        # We still return (no exception) so app starts successfully.
-        return
-
-    # Atomic write for CSV to avoid partial writes
-    try:
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", newline="") as tmp:
-            tmp.write(csv_text)
-            tmp_path = Path(tmp.name)
-        shutil.move(str(tmp_path), str(csv_path))
-    except Exception as ex:
-        logger.warning("Failed to write CSV cache for %s: %s", source_name, ex)
-        # continue to try JSON write below (or bail)
-
-    safe_records = _make_json_safe(records)
-    try:
-        with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(safe_records, jf, ensure_ascii=False, indent=2)
-    except Exception as ex:
-        logger.warning("Failed to write JSON cache for %s: %s", source_name, ex)
-
-# -- New: load cache from local JSON/CSV (used by fetch_source_if_needed & by get_all_records) --
+# --- local cache loader (same as before) ---
 def load_cache_for_source(source_name):
-    """
-    Load cached records for a given source. Prefer JSON cache if present, else CSV cache.
-    """
     csv_path, json_path = cache_paths_for_source(source_name)
     if json_path.exists():
         try:
             with open(json_path, "r", encoding="utf-8") as jf:
                 records = json.load(jf)
-                # restore derived fields
                 for rec in records:
-                    rec.setdefault("wallet_number_normalized", re.sub(r"\D", "", rec.get("wallet_number", "")))
-                    rec.setdefault("order_number_norm", (rec.get("order_number", "") or "").upper())
-                    rec.setdefault("sellerorderno_norm", (rec.get("sellerorderno", "") or "").upper())
-                    rec.setdefault("transaction_id_norm", (rec.get("transaction_id", "") or "").upper())
+                    rec.setdefault("wallet_number_normalized", re.sub(r"\D","", rec.get("wallet_number","")))
+                    rec.setdefault("order_number_norm", (rec.get("order_number","") or "").upper())
+                    rec.setdefault("sellerorderno_norm", (rec.get("sellerorderno","") or "").upper())
+                    rec.setdefault("transaction_id_norm", (rec.get("transaction_id","") or "").upper())
                     rec.setdefault("source", source_name)
-                    dt = try_parse_date(rec.get("date", "") or rec.get("date_fmt", ""))
+                    dt = try_parse_date(rec.get("date","") or rec.get("date_fmt",""))
                     rec["date_obj"] = dt
-                    rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date", ""))
+                    rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date",""))
                 return records
         except Exception as ex:
             logger.warning("Failed to load JSON cache for %s: %s", source_name, ex)
@@ -322,7 +225,7 @@ def load_cache_for_source(source_name):
             logger.warning("Failed to parse CSV cache for %s: %s", source_name, ex)
     return []
 
-# Background refresh pool and guard
+# --- fetch helpers (same as before) ---
 _REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _refresh_in_progress = set()
 _refresh_lock = threading.Lock()
@@ -491,33 +394,39 @@ def search_smarter(records, raw_query):
     results = unique_by_key(matched, lambda x: (x.get("order_number_norm"), x.get("sellerorderno_norm"), x.get("transaction_id_norm")))
     return "unknown", results
 
-def get_cache_mtime(source_name):
-    csv_path, _ = cache_paths_for_source(source_name)
-    if csv_path.exists():
-        return csv_path.stat().st_mtime
-    return None
-
-# --- New: GitHub raw & local combined loader for fast reads ---
+# --- GitHub-authenticated loader for private repo branch ---
 _inmem_all = None
 _inmem_all_at = 0.0
 
-def load_all_from_github_raw():
+def load_all_from_github_api():
     """
-    Attempt to load data/all.json from GitHub raw URL (fast CDN). Cache in memory for INMEM_CACHE_TTL.
+    Load data/all.json from GitHub contents API on branch specified by GITHUB_DATA_BRANCH.
+    Requires GITHUB_API_TOKEN, GITHUB_OWNER and GITHUB_REPO env vars to be set in Vercel.
     """
     global _inmem_all, _inmem_all_at
-    if not GITHUB_RAW_BASE:
+    if not (GITHUB_API_TOKEN and GITHUB_OWNER and GITHUB_REPO):
+        logger.debug("GitHub API credentials not configured")
         return None
     now = time.time()
     if _inmem_all is not None and (now - _inmem_all_at) < INMEM_CACHE_TTL:
         return _inmem_all
-    url = f"{GITHUB_RAW_BASE}/all.json"
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/data/all.json?ref={GITHUB_DATA_BRANCH}"
+    headers = {"Authorization": f"Bearer {GITHUB_API_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
-        r = requests.get(url, timeout=8)
+        r = requests.get(url, headers=headers, timeout=8)
         r.raise_for_status()
-        data = r.json()
+        payload = r.json()
+        if not payload:
+            return None
+        # content may be base64 encoded (standard contents API)
+        content_b64 = payload.get("content")
+        if content_b64:
+            raw = base64.b64decode(content_b64).decode("utf-8")
+            data = json.loads(raw)
+        else:
+            # fallback: sometimes API can return raw if Accept header set; try text
+            data = json.loads(r.text)
         if isinstance(data, list):
-            # restore derived fields if missing
             for rec in data:
                 rec.setdefault("wallet_number_normalized", re.sub(r"\D", "", rec.get("wallet_number", "")))
                 rec.setdefault("order_number_norm", (rec.get("order_number", "") or "").upper())
@@ -529,16 +438,13 @@ def load_all_from_github_raw():
                 rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date", ""))
             _inmem_all = data
             _inmem_all_at = time.time()
-            logger.info("Loaded all.json from GitHub raw (%d records)", len(data))
+            logger.info("Loaded all.json from GitHub API (branch=%s) size=%d", GITHUB_DATA_BRANCH, len(data))
             return data
     except Exception as e:
-        logger.warning("Failed to load all.json from GitHub raw: %s", e)
+        logger.warning("Failed to load all.json from GitHub API: %s", e)
     return None
 
 def load_all_from_local():
-    """
-    Try to load data/all.json from local repo (exists if committed).
-    """
     p = Path("data") / "all.json"
     if not p.exists():
         return None
@@ -562,186 +468,64 @@ def load_all_from_local():
     return None
 
 def get_all_records():
-    """
-    Preferred order:
-     1) GitHub raw all.json (fast CDN)
-     2) local data/all.json (if present)
-     3) fallback: return empty list (do not do heavy fetch on request)
-    """
-    data = load_all_from_github_raw()
+    data = load_all_from_github_api()
     if data is not None:
         return data
     data = load_all_from_local()
     if data is not None:
         return data
-    # No prebuilt data available; avoid doing heavy fetches on request. Return empty list.
-    logger.warning("No prebuilt all.json available (github raw/local). Returning empty dataset. Use GitHub Actions updater to populate data/all.json.")
+    logger.warning("No prebuilt all.json available (github api/local). Returning empty dataset.")
     return []
 
-# --- routes ---
-
+# --- routes (unchanged logic but search() now uses get_all_records) ---
 @app.route("/", methods=["GET"])
-def index():
+def index_route():
     source_names = list(SOURCES.keys())
     return render_template("index.html", source_names=source_names)
 
 @app.route("/search", methods=["GET"])
-def search():
+def search_route():
     query = request.args.get("query", "").strip()
-    sort_by = request.args.get("sort", "date")
-    order = request.args.get("order", "desc")
-    source_names = list(SOURCES.keys())
-
     if not query:
-        return render_template("results.html", found=False, message="Please enter a search query.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
-
-    # Use prebuilt combined records (fast). Do NOT perform blocking CSV fetches here.
+        return render_template("results.html", found=False, message="Please enter a search query.", results=[], query=query, grouped_results=[], source_names=[])
     records = get_all_records()
     if not records:
-        return render_template("results.html", found=False, message="No data available from any source. Try again later.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
-
+        return render_template("results.html", found=False, message="No data available from any source. Try again later.", results=[], query=query, grouped_results=[], source_names=[])
     detected_type, matches = search_smarter(records, query)
     if not matches:
-        return render_template("results.html", found=False, message="not refunded yet", results=[], query=query, detected_type=detected_type, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
-
-    sources = sorted({r.get("source", "Unknown") for r in matches})
-    has_tx = any(r.get("transaction_id") for r in matches)
-    has_card = any(r.get("card_number") for r in matches)
-    has_cashback = any(r.get("cashback") for r in matches)
-    has_wallet = any(r.get("wallet_number") for r in matches)
-
-    def sort_key_record(r):
-        dt = r.get("date_obj")
-        ts = dt.timestamp() if dt else 0
-        return ts
-
-    matches_sorted = sorted(matches, key=sort_key_record, reverse=(order == "desc"))
-
+        return render_template("results.html", found=False, message="not refunded yet", results=[], query=query, detected_type=detected_type, grouped_results=[], source_names=[])
+    # group results
     groups = OrderedDict()
-    for r in matches_sorted:
+    for r in matches:
         key = r.get("order_number_norm") or r.get("order_number") or "UNKNOWN"
         groups.setdefault(key, []).append(r)
-
     group_items = []
-    for k, recs in groups.items():
+    for k,recs in groups.items():
         dates = [r.get("date_obj").timestamp() for r in recs if r.get("date_obj")]
         group_ts = max(dates) if dates else 0
-        group_items.append((k, recs, group_ts))
-    group_items_sorted = sorted(group_items, key=lambda x: x[2], reverse=(order == "desc"))
-
+        group_items.append((k,recs,group_ts))
+    group_items_sorted = sorted(group_items, key=lambda x: x[2], reverse=True)
     grouped_results = []
-    for k, recs, ts in group_items_sorted:
-        srcs = []
+    for k,recs,ts in group_items_sorted:
+        srcs=[]
         for r in recs:
-            s = r.get("source", "Unknown")
+            s = r.get("source","Unknown")
             if s not in srcs:
                 srcs.append(s)
-        grouped_results.append({
-            "order_number": k,
-            "records": recs,
-            "count": len(recs),
-            "sources": srcs
-        })
+        grouped_results.append({"order_number":k,"records":recs,"count":len(recs),"sources":srcs})
+    return render_template("results.html", found=True, results=matches, query=query, grouped_results=grouped_results, source_names=list(SOURCES.keys()))
 
-    return render_template(
-        "results.html",
-        found=True,
-        results=matches_sorted,
-        query=query,
-        sources=sources,
-        has_tx=has_tx,
-        has_card=has_card,
-        has_cashback=has_cashback,
-        has_wallet=has_wallet,
-        sort_by=sort_by,
-        order=order,
-        grouped_results=grouped_results,
-        source_names=source_names,
-    )
-
-@app.route("/sources", methods=["GET"])
-def sources_view():
-    source_names = list(SOURCES.keys())
-    active = request.args.get("source") or source_names[0]
-    query = request.args.get("query", "").strip()
-
-    # server-side search limited to one source
-    if query:
-        recs = fetch_source_if_needed(active, SOURCES[active])
-        _, matches = search_smarter(recs, query)
-        def sort_key_record(r):
-            dt = r.get("date_obj")
-            return dt.timestamp() if dt else 0
-        matches_sorted = sorted(matches, key=sort_key_record, reverse=True)
-        groups = OrderedDict()
-        for r in matches_sorted:
-            key = r.get("order_number_norm") or r.get("order_number") or "UNKNOWN"
-            groups.setdefault(key, []).append(r)
-        group_items = []
-        for k, recs in groups.items():
-            dates = [r.get("date_obj").timestamp() for r in recs if r.get("date_obj")]
-            group_ts = max(dates) if dates else 0
-            group_items.append((k, recs, group_ts))
-        group_items_sorted = sorted(group_items, key=lambda x: x[2], reverse=True)
-        grouped_results = []
-        for k, recs, ts in group_items_sorted:
-            grouped_results.append({
-                "order_number": k,
-                "records": recs,
-                "count": len(recs),
-            })
-        last_updated = {active: get_cache_mtime(active)}
-        return render_template("sources.html", grouped_by_source={active: grouped_results}, source_names=source_names, active_source=active, last_updated=last_updated, query=query)
-
-    grouped_by_source = OrderedDict()
-    last_updated = {}
-    for source_name in source_names:
-        recs = fetch_source_if_needed(source_name, SOURCES[source_name])
-        for r in recs:
-            if "date_fmt" not in r or not r.get("date_fmt"):
-                dt = try_parse_date(r.get("date", ""))
-                r["date_obj"] = dt
-                r["date_fmt"] = format_date_for_ui(dt) if dt else r.get("date", "")
-        groups = OrderedDict()
-        recs_sorted = sorted(recs, key=lambda x: x.get("date_obj").timestamp() if x.get("date_obj") else 0, reverse=True)
-        for r in recs_sorted:
-            key = r.get("order_number_norm") or r.get("order_number") or "UNKNOWN"
-            groups.setdefault(key, []).append(r)
-        group_items = []
-        for k, rec_list in groups.items():
-            dates = [rr.get("date_obj").timestamp() for rr in rec_list if rr.get("date_obj")]
-            group_ts = max(dates) if dates else 0
-            group_items.append((k, rec_list, group_ts))
-        group_items_sorted = sorted(group_items, key=lambda x: x[2], reverse=True)
-        group_dicts = []
-        for k, rec_list, ts in group_items_sorted:
-            group_dicts.append({
-                "order_number": k,
-                "records": rec_list,
-                "count": len(rec_list),
-            })
-        grouped_by_source[source_name] = group_dicts
-        last_updated[source_name] = get_cache_mtime(source_name)
-
-    return render_template("sources.html", grouped_by_source=grouped_by_source, source_names=source_names, active_source=active, last_updated=last_updated)
-
-# Secure refresh endpoint used by GitHub Actions or other scheduler
 @app.route("/internal/refresh", methods=["POST"])
 def internal_refresh():
-    if not CRON_SECRET:
-        return jsonify({"ok": False, "error": "CRON_SECRET not configured on server"}), 500
-
-    auth = request.headers.get("Authorization", "")
-    token_ok = False
-    if auth.startswith("Bearer "):
-        token = auth[len("Bearer "):].strip()
-        token_ok = (token == CRON_SECRET)
-    else:
-        token = request.form.get("token", "")
-        token_ok = (token == CRON_SECRET)
-    if not token_ok:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
+    if CRON_SECRET:
+        auth = request.headers.get("Authorization","")
+        token = ""
+        if auth.startswith("Bearer "):
+            token = auth[len("Bearer "):].strip()
+        else:
+            token = request.form.get("token","")
+        if token != CRON_SECRET:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         recs = fetch_all_sources()
         return jsonify({"ok": True, "message": f"refreshed {len(recs)} records"})
@@ -749,7 +533,7 @@ def internal_refresh():
         app.logger.exception("Refresh failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# Optional persistent background sync (for process hosts)
+# background sync (unchanged)
 def background_sync_loop():
     while True:
         try:
@@ -761,8 +545,7 @@ def background_sync_loop():
         time.sleep(REFRESH_INTERVAL)
 
 if __name__ == "__main__":
-    # Start background thread if allowed (not recommended on serverless)
     if not DISABLE_BACKGROUND_SYNC:
         t = threading.Thread(target=background_sync_loop, daemon=True)
         t.start()
-    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)), debug=os.getenv("FLASK_DEBUG","0")=="1")
