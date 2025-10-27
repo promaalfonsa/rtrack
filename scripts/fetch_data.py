@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
 Fetch CSV sources, parse to records, write JSON files under data/.
-This script is used by GitHub Actions to update data/*.json
+This script is used by GitHub Actions (update-data workflow) to update data/*.json.
+Fixed: avoid backslashes in f-string expressions by computing safe_name separately.
 """
-import requests, csv, io, json, os, re, sys, tempfile, shutil
+import requests
+import csv
+import io
+import json
+import os
+import re
 from datetime import datetime
 
 SOURCES = {
@@ -22,9 +28,9 @@ DATA_DIR = os.path.join(os.getcwd(), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def normalize_header(raw):
-    if raw is None: return ""
+    if raw is None:
+        return ""
     h = raw.strip().lower()
-    # minimal header normalization similar to your app
     mapping = {
         "date":"date", "order number":"order_number", "ordernumber":"order_number", "order_no":"order_number",
         "order":"order_number", "sellerorderno":"sellerorderno", "payment method":"payment_method",
@@ -37,17 +43,18 @@ def parse_csv_text(text, source_name):
     f = io.StringIO(text)
     reader = csv.reader(f)
     rows = list(reader)
-    if not rows: return []
+    if not rows:
+        return []
     headers = [normalize_header(h) for h in rows[0]]
     records = []
     for r in rows[1:]:
-        if not any(cell.strip() for cell in r): continue
+        if not any(cell.strip() for cell in r):
+            continue
         row = list(r) + [""] * max(0, len(headers) - len(r))
         rec = {}
         for i, h in enumerate(headers):
             rec[h] = row[i].strip()
         rec["source"] = source_name
-        # normalize a few fields for convenience
         rec["wallet_number_normalized"] = re.sub(r"\D", "", rec.get("wallet_number","") or "")
         rec["order_number_norm"] = (rec.get("order_number","") or "").upper()
         rec["sellerorderno_norm"] = (rec.get("sellerorderno","") or "").upper()
@@ -64,14 +71,14 @@ def fetch_and_write():
             text = r.content.decode("utf-8", errors="replace")
             recs = parse_csv_text(text, name)
             all_records.extend(recs)
-            # per-source JSON
-            fname = os.path.join(DATA_DIR, f"{re.sub(r'[^\\w\\-]','_',name).lower()}.json")
+            # compute safe file name without backslashes inside f-string expression
+            safe_name = re.sub(r"[^\w\-]", "_", name).lower()
+            fname = os.path.join(DATA_DIR, f"{safe_name}.json")
             with open(fname, "w", encoding="utf-8") as f:
                 json.dump(recs, f, ensure_ascii=False)
-            print(f"Wrote {len(recs)} records for {name}")
+            print(f"Wrote {len(recs)} records for {name} -> {fname}")
         except Exception as e:
             print("Failed to fetch", name, e)
-    # write combined all.json
     combined_path = os.path.join(DATA_DIR, "all.json")
     with open(combined_path, "w", encoding="utf-8") as f:
         json.dump(all_records, f, ensure_ascii=False)
