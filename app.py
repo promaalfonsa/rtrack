@@ -1,4 +1,5 @@
-from flask import Flask, render_template, request, url_for
+# app.py
+from flask import Flask, render_template, request, jsonify
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -16,6 +17,7 @@ import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import os
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -24,7 +26,6 @@ def timestamp_to_string(ts):
     try:
         if not ts:
             return ""
-        # ts may be float or int or string
         t = int(ts)
         dt = datetime.fromtimestamp(t)
         return dt.strftime("%d %b %Y %H:%M")
@@ -33,7 +34,7 @@ def timestamp_to_string(ts):
 
 app.jinja_env.filters['timestamp_to_string'] = timestamp_to_string
 
-# --- Configuration ---
+# --- Configuration (default public CSV sources) ---
 SOURCES = {
     "Bkash": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRLeRzOYkgTFBvY1jNnCSy9jwg967E5lUd133CUnrhfaMsfEOfxLRjIUPoWPtdKaYhYjMduj7GIVU9E/pub?gid=0&single=true&output=csv",
     "Nagad": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRLeRzOYkgTFBvY1jNnCSy9jwg967E5lUd133CUnrhfaMsfEOfxLRjIUPoWPtdKaYhYjMduj7GIVU9E/pub?gid=710748437&single=true&output=csv",
@@ -46,17 +47,31 @@ SOURCES = {
     "SEBL": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRLeRzOYkgTFBvY1jNnCSy9jwg967E5lUd133CUnrhfaMsfEOfxLRjIUPoWPtdKaYhYjMduj7GIVU9E/pub?gid=119713136&single=true&output=csv",
 }
 
+# Allow overriding via env vars SOURCE_<safe_name>
+for key in list(SOURCES.keys()):
+    safe = "".join([c if (c.isalnum() or c == "_") else "_" for c in key]).lower()
+    env_key = f"SOURCE_{safe}"
+    if os.getenv(env_key):
+        SOURCES[key] = os.getenv(env_key)
+
+# Data directory & cache settings
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-CACHE_TTL = 600  # seconds (10 minutes)
-REQUEST_TIMEOUT = 8  # seconds
-MAX_RETRIES = 2
-BACKOFF_FACTOR = 0.5
+CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))  # 10 minutes default
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
+BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", "0.5"))
 
+# Background refresh config
+REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "600"))  # seconds between background runs
+DISABLE_BACKGROUND_SYNC = os.getenv("DISABLE_BACKGROUND_SYNC", "0") == "1"  # set to "1" on serverless
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+
+# logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Map possible header names to canonical keys
+# Header mapping and helpers (same as your original parsing logic)
 HEADER_MAP = {
     "date": "date",
     "order number": "order_number",
@@ -82,12 +97,6 @@ HEADER_MAP = {
     "transaction": "transaction_id",
 }
 
-# Background refresh pool and guard
-_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
-_refresh_in_progress = set()
-_refresh_lock = threading.Lock()
-
-
 def requests_session_with_retries():
     s = requests.Session()
     retries = Retry(
@@ -100,7 +109,6 @@ def requests_session_with_retries():
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
-
 
 def safe_decimal_str(value):
     if value is None:
@@ -119,13 +127,11 @@ def safe_decimal_str(value):
             return v
     return v
 
-
 def normalize_header(raw):
     if raw is None:
         return ""
     h = raw.strip().lower()
     return HEADER_MAP.get(h, h.replace(" ", "_"))
-
 
 def try_parse_date(s):
     s = (s or "").strip()
@@ -161,12 +167,10 @@ def try_parse_date(s):
     except Exception:
         return None
 
-
 def format_date_for_ui(dt):
     if not dt:
         return ""
     return dt.strftime("%d %b %Y")
-
 
 def parse_csv_content(content, source_name):
     f = io.StringIO(content)
@@ -201,20 +205,18 @@ def parse_csv_content(content, source_name):
         rec["date_obj"] = dt
         rec["date_fmt"] = format_date_for_ui(dt) if dt else rec["date"]
 
-        rec["order_number_norm"] = rec["order_number"].upper()
-        rec["sellerorderno_norm"] = rec["sellerorderno"].upper()
-        rec["transaction_id_norm"] = rec["transaction_id"].upper()
+        rec["order_number_norm"] = (rec["order_number"] or "").upper()
+        rec["sellerorderno_norm"] = (rec["sellerorderno"] or "").upper()
+        rec["transaction_id_norm"] = (rec["transaction_id"] or "").upper()
         rec["source"] = source_name
         records.append(rec)
     return records
-
 
 def cache_paths_for_source(source_name):
     safe_name = re.sub(r"[^\w\-]", "_", source_name).lower()
     csv_path = DATA_DIR / f"refunds_{safe_name}.csv"
     json_path = DATA_DIR / f"refunds_{safe_name}.json"
     return csv_path, json_path
-
 
 def _make_json_safe(records):
     safe = []
@@ -237,11 +239,9 @@ def _make_json_safe(records):
         safe.append(rec)
     return safe
 
-
 def save_cache_for_source(source_name, csv_text, records):
     csv_path, json_path = cache_paths_for_source(source_name)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # atomic write for CSV
     with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", newline="") as tmp:
         tmp.write(csv_text)
         tmp_path = Path(tmp.name)
@@ -252,7 +252,6 @@ def save_cache_for_source(source_name, csv_text, records):
             json.dump(safe_records, jf, ensure_ascii=False, indent=2)
     except Exception as ex:
         logger.warning("Failed to write JSON cache for %s: %s", source_name, ex)
-
 
 def load_cache_for_source(source_name):
     csv_path, json_path = cache_paths_for_source(source_name)
@@ -280,6 +279,9 @@ def load_cache_for_source(source_name):
             logger.warning("Failed to parse CSV cache for %s: %s", source_name, ex)
     return []
 
+_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+_refresh_in_progress = set()
+_refresh_lock = threading.Lock()
 
 def _schedule_background_refresh(source_name: str, url: str):
     with _refresh_lock:
@@ -289,7 +291,6 @@ def _schedule_background_refresh(source_name: str, url: str):
         _refresh_in_progress.add(source_name)
     logger.info("Scheduling background refresh for %s", source_name)
     _REFRESH_EXECUTOR.submit(_background_refresh_worker, source_name, url)
-
 
 def _background_refresh_worker(source_name: str, url: str):
     try:
@@ -307,14 +308,7 @@ def _background_refresh_worker(source_name: str, url: str):
         with _refresh_lock:
             _refresh_in_progress.discard(source_name)
 
-
 def fetch_source_if_needed(source_name, url):
-    """
-    Stale-while-revalidate:
-      - If cache exists and fresh -> return it
-      - If cache exists and stale -> return cached immediately, schedule background refresh
-      - If no cache -> blocking fetch (first-run) with small timeout and fallback to empty
-    """
     csv_path, json_path = cache_paths_for_source(source_name)
     now = time.time()
     if csv_path.exists():
@@ -331,8 +325,6 @@ def fetch_source_if_needed(source_name, url):
                 return recs
         except Exception as ex:
             logger.warning("Error reading cache for %s: %s", source_name, ex)
-            # fall through to blocking fetch
-    # No cache available -> blocking fetch
     session = requests_session_with_retries()
     try:
         logger.info("No cache present for %s — performing blocking fetch", source_name)
@@ -351,7 +343,6 @@ def fetch_source_if_needed(source_name, url):
         logger.error("No cache available for %s and fetch failed", source_name)
         return []
 
-
 def fetch_all_sources():
     all_records = []
     for source_name, url in SOURCES.items():
@@ -360,7 +351,6 @@ def fetch_all_sources():
             all_records.extend(recs)
     return all_records
 
-
 def build_indices(records):
     by_order = defaultdict(list)
     by_seller = defaultdict(list)
@@ -368,7 +358,6 @@ def build_indices(records):
         by_order[r.get("order_number_norm", "")].append(r)
         by_seller[r.get("sellerorderno_norm", "")].append(r)
     return by_order, by_seller
-
 
 def unique_by_key(records, key_fn):
     seen = set()
@@ -380,7 +369,6 @@ def unique_by_key(records, key_fn):
         seen.add(k)
         out.append(r)
     return out
-
 
 def detect_query_type(q):
     s = (q or "").strip()
@@ -405,7 +393,6 @@ def detect_query_type(q):
         except Exception:
             pass
     return "unknown", s_clean
-
 
 def search_smarter(records, raw_query):
     qtype, qvalue = detect_query_type(raw_query)
@@ -460,13 +447,11 @@ def search_smarter(records, raw_query):
     results = unique_by_key(matched, lambda x: (x.get("order_number_norm"), x.get("sellerorderno_norm"), x.get("transaction_id_norm")))
     return "unknown", results
 
-
 def get_cache_mtime(source_name):
     csv_path, _ = cache_paths_for_source(source_name)
     if csv_path.exists():
         return csv_path.stat().st_mtime
     return None
-
 
 # --- routes ---
 
@@ -474,7 +459,6 @@ def get_cache_mtime(source_name):
 def index():
     source_names = list(SOURCES.keys())
     return render_template("index.html", source_names=source_names)
-
 
 @app.route("/search", methods=["GET"])
 def search():
@@ -486,7 +470,6 @@ def search():
     if not query:
         return render_template("results.html", found=False, message="Please enter a search query.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
 
-    # search across all sources (will use stale-while-revalidate to avoid long waits)
     records = fetch_all_sources()
     if not records:
         return render_template("results.html", found=False, message="No data available from any source.", results=[], query=query, sources=[], has_tx=False, has_card=False, has_cashback=False, has_wallet=False, sort_by=sort_by, order=order, grouped_results=[], source_names=source_names)
@@ -550,7 +533,6 @@ def search():
         source_names=source_names,
     )
 
-
 @app.route("/sources", methods=["GET"])
 def sources_view():
     source_names = list(SOURCES.keys())
@@ -582,11 +564,9 @@ def sources_view():
                 "records": recs,
                 "count": len(recs),
             })
-        # Build a minimal grouped_by_source to render exactly the active source
         last_updated = {active: get_cache_mtime(active)}
         return render_template("sources.html", grouped_by_source={active: grouped_results}, source_names=source_names, active_source=active, last_updated=last_updated, query=query)
 
-    # No query: build grouped inspection view for all sources
     grouped_by_source = OrderedDict()
     last_updated = {}
     for source_name in source_names:
@@ -596,7 +576,6 @@ def sources_view():
                 dt = try_parse_date(r.get("date", ""))
                 r["date_obj"] = dt
                 r["date_fmt"] = format_date_for_ui(dt) if dt else r.get("date", "")
-        # group by order_number_norm and sort groups by latest date desc
         groups = OrderedDict()
         recs_sorted = sorted(recs, key=lambda x: x.get("date_obj").timestamp() if x.get("date_obj") else 0, reverse=True)
         for r in recs_sorted:
@@ -620,6 +599,44 @@ def sources_view():
 
     return render_template("sources.html", grouped_by_source=grouped_by_source, source_names=source_names, active_source=active, last_updated=last_updated)
 
+# Secure refresh endpoint used by GitHub Actions or other scheduler
+@app.route("/internal/refresh", methods=["POST"])
+def internal_refresh():
+    if not CRON_SECRET:
+        return jsonify({"ok": False, "error": "CRON_SECRET not configured on server"}), 500
+
+    auth = request.headers.get("Authorization", "")
+    token_ok = False
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):].strip()
+        token_ok = (token == CRON_SECRET)
+    else:
+        token = request.form.get("token", "")
+        token_ok = (token == CRON_SECRET)
+    if not token_ok:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    try:
+        recs = fetch_all_sources()
+        return jsonify({"ok": True, "message": f"refreshed {len(recs)} records"})
+    except Exception as e:
+        app.logger.exception("Refresh failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# Optional persistent background sync (for process hosts)
+def background_sync_loop():
+    while True:
+        try:
+            app.logger.info("Background sync: starting fetch_all_sources()")
+            fetch_all_sources()
+            app.logger.info("Background sync: done")
+        except Exception:
+            app.logger.exception("Background sync error")
+        time.sleep(REFRESH_INTERVAL)
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # Start background thread if allowed (not recommended on serverless)
+    if not DISABLE_BACKGROUND_SYNC:
+        t = threading.Thread(target=background_sync_loop, daemon=True)
+        t.start()
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
