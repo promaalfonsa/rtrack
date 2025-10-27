@@ -30,7 +30,7 @@ jobs:
         run: |
           python scripts/fetch_data.py
 
-      - name: Commit and push changes (if any)
+      - name: Commit and push changes (if any) to data-updates
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -41,5 +41,6 @@ jobs:
             echo "No data changes to commit"
           else
             git commit -m "chore(data): update cached CSV JSONs [skip ci]"
-            git push origin HEAD:main
+            # push to data-updates branch (create or update)
+            git push origin HEAD:data-updates
           fi
