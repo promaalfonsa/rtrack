@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Refund Tracker</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+      :root{
+        --bg:#f6f8fa;
+        --card:#ffffff;
+        --muted:#6b7280;
+        --accent:#0b5fff;
+        --border:#e6e9ef;
+      }
+      *{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+      body{margin:0;background:var(--bg);color:#111827;}
+      .layout{display:flex;min-height:100vh;}
+      .sidebar{width:220px;background:#ffffff;border-right:1px solid var(--border);padding:18px;box-shadow:0 4px 14px rgba(15,23,42,0.03)}
+      .sidebar h2{margin:0 0 12px 0;font-size:16px;font-weight:800}
+      .side-list{display:flex;flex-direction:column;gap:8px;overflow:auto;max-height:calc(100vh - 120px);}
+      .side-item{padding:10px 12px;border-radius:8px;cursor:pointer;color:#0b355f;font-weight:700;border:1px solid transparent;text-decoration:none;display:block}
+      .side-item.active{background:linear-gradient(90deg, rgba(11,95,255,0.06), transparent);border-color:var(--accent)}
+      .main{flex:1;padding:28px;}
+      .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:22px;box-shadow:0 6px 18px rgba(15,23,42,0.06);}
+      .search-row{display:flex;gap:12px;align-items:center;}
+      .search-input{flex:1;border:1px solid var(--border);padding:14px 16px;border-radius:10px;font-size:16px;}
+      .search-input:focus{outline:none;box-shadow:0 0 0 4px rgba(11,95,255,0.08);border-color:var(--accent);}
+      .btn{background:var(--accent);color:white;padding:12px 18px;border-radius:10px;border:none;font-weight:600;cursor:pointer;}
+      .hint{color:var(--muted);margin-top:12px;font-size:14px}
+      .small{font-size:13px;color:var(--muted)}
+      .detected{display:inline-block;padding:6px 10px;border-radius:999px;background:#eef6ff;color:var(--accent);font-weight:600;margin-left:8px;font-size:13px}
+      @media (max-width:900px){
+        .sidebar{display:none}
+        .search-row{flex-direction:column;align-items:stretch;}
+      }
+    </style>
+    <script>
+      function detectTypeOnClient(q) {
+        q = (q||'').trim();
+        if (!q) return '';
+        const clean = q.replace(/[^\w\-]/g,'');
+        if (/^0(1\d{9})$/.test(clean)) return 'Phone';
+        if (/^25\d{12}$/.test(clean)) return 'Order';
+        if (/^CU[\w\-\_]+$/i.test(clean)) return 'Seller';
+        return '';
+      }
+      function onInputChange() {
+        const v = document.getElementById('query').value;
+        const detected = detectTypeOnClient(v);
+        const el = document.getElementById('detected');
+        el.textContent = detected ? detected : 'Auto';
+      }
+      document.addEventListener('DOMContentLoaded', function(){
+        const q = document.getElementById('query');
+        q.addEventListener('input', onInputChange);
+        onInputChange();
+      });
+    </script>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar" aria-label="Sources">
+        <h2>Sources</h2>
+        <div class="side-list" role="tablist">
+          {% for name in source_names %}
+            <a class="side-item" href="{{ url_for('sources_view') }}?source={{ name }}">{{ name }}</a>
+          {% endfor %}
+        </div>
+      </aside>
+
+      <main class="main">
+        <header style="display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <h1 style="margin:0;font-size:22px">Refund Tracker</h1>
+            <div class="small">Smart lookup across all refund sources</div>
+          </div>
+        </header>
+
+        <div class="card" role="region" aria-label="Search refunds" style="margin-top:16px;">
+          <form action="{{ url_for('search') }}" method="get">
+            <div class="search-row">
+              <input id="query" name="query" class="search-input" placeholder="Paste Order (14 digits starting with 25) or Seller code (CU...) or phone (0XXXXXXXXXX)" required autocomplete="off" />
+              <button type="submit" class="btn">Search</button>
+              <div title="Detected type" style="margin-left:8px">
+                <span id="detected" class="detected">Auto</span>
+              </div>
+            </div>
+          </form>
+
+          <div class="hint">
+            Tip: You don't need to choose a type — the app detects it:
+            <ul style="margin-top:8px;color:var(--muted);">
+              <li>Order: 14 digits, starts with 25 (e.g. 25101234567890)</li>
+              <li>SellerOrderNo: starts with CU (e.g. CU251014...)</li>
+              <li>Phone: enter with leading 0 (e.g. 01712345678)</li>
+            </ul>
+          </div>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

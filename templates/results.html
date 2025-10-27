@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Refund Tracker Results</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+      :root{
+        --bg:#f6f8fa;
+        --card:#ffffff;
+        --muted:#6b7280;
+        --accent:#0b5fff;
+        --border:#e6e9ef;
+        --source-bg:#eef2ff;
+      }
+      *{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+      body{margin:0;background:var(--bg);color:#111827;}
+      .layout{display:flex;min-height:100vh;}
+      .sidebar{width:220px;background:#ffffff;border-right:1px solid var(--border);padding:18px;box-shadow:0 4px 14px rgba(15,23,42,0.03)}
+      .side-list{display:flex;flex-direction:column;gap:8px;overflow:auto;max-height:calc(100vh - 120px);}
+      .side-item{padding:10px 12px;border-radius:8px;cursor:pointer;color:#0b355f;font-weight:700;border:1px solid transparent;text-decoration:none;display:block}
+      .side-item.active{background:linear-gradient(90deg, rgba(11,95,255,0.06), transparent);border-color:var(--accent)}
+      .main{flex:1;padding:28px;}
+      .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:22px;box-shadow:0 6px 18px rgba(15,23,42,0.06);}
+      .msg{padding:12px;border-radius:8px;background:#f8fafc;border:1px solid #eef2ff;color:#0b375f;font-weight:600;display:flex;align-items:center;gap:12px}
+      .seller-table{width:100%;border-collapse:collapse;margin-top:8px}
+      .seller-table th, .seller-table td{padding:8px;border:none;border-top:1px solid #f1f3f5}
+      .source-badge{display:inline-block;padding:6px 10px;border-radius:8px;background:var(--source-bg);color:#0b3a99;font-weight:700;margin-left:8px;font-size:13px}
+      .order-header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+      .order-title{font-weight:700;color:#0b355f}
+      .toggle{background:#fff;border:1px solid #e6e9ef;padding:6px 10px;border-radius:8px;cursor:pointer;color:var(--muted)}
+      @media (max-width:900px){
+        .sidebar{display:none}
+        .layout{flex-direction:column}
+        .main{padding:16px}
+      }
+    </style>
+    <script>
+      function toggleAll(expand) {
+        document.querySelectorAll('details.group').forEach(d => {
+          if (expand) d.setAttribute('open','');
+          else d.removeAttribute('open');
+        });
+      }
+    </script>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar" aria-label="Sources">
+        <h2 style="margin:0 0 12px 0;font-size:16px;font-weight:800">Sources</h2>
+        <div class="side-list" role="tablist">
+          {% for name in source_names %}
+            <a class="side-item" href="{{ url_for('sources_view') }}?source={{ name }}">{{ name }}</a>
+          {% endfor %}
+        </div>
+      </aside>
+
+      <main class="main">
+        <header style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <h1 style="margin:0;font-size:20px">Refund Tracker Results</h1>
+          </div>
+          <div>
+            <a href="{{ url_for('index') }}" class="small">← Home</a>
+          </div>
+        </header>
+
+        <div style="margin-top:12px">
+          <form id="search-form" action="{{ url_for('search') }}" method="get" style="display:flex;gap:12px;align-items:center;">
+            <input name="query" value="{{ query }}" placeholder="Search order/seller/phone..." style="flex:1;padding:12px;border-radius:8px;border:1px solid #e6e9ef;font-size:15px" required />
+            <input type="hidden" name="sort" value="{{ sort_by }}" />
+            <input type="hidden" name="order" value="{{ order }}" id="order-input"/>
+            <button type="submit" class="btn">Search</button>
+          </form>
+
+          <div style="display:flex;gap:12px;align-items:center;margin-top:10px">
+            <form id="sort-form" action="{{ url_for('search') }}" method="get" style="display:flex;gap:8px;align-items:center;">
+              <input type="hidden" name="query" value="{{ query }}" />
+              <input type="hidden" name="sort" value="date" />
+              <input type="hidden" name="order" value="{{ 'asc' if order=='desc' else 'desc' }}" />
+              <button type="submit" class="btn" style="background:#fff;color:var(--accent);border:1px solid var(--accent);font-weight:700">
+                {% if order == 'desc' %}Newest first ↓{% else %}Oldest first ↑{% endif %}
+              </button>
+            </form>
+            <div style="margin-left:12px;color:var(--muted)" class="small">Dates shown like: 26 Oct 2025</div>
+            <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+              <button class="toggle" onclick="toggleAll(true)">Expand all</button>
+              <button class="toggle" onclick="toggleAll(false)">Collapse all</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:12px;">
+          {% if not found %}
+            <div class="msg">{{ message }}</div>
+          {% else %}
+            <div class="msg" role="status" aria-live="polite">
+              <div>
+                Found {{ results|length }} record(s) for "<strong>{{ query }}</strong>"
+              </div>
+            </div>
+
+            {% for group in grouped_results %}
+              <details class="group" open>
+                <summary>
+                  <div class="order-header" style="width:100%;">
+                    <div>
+                      <div class="order-title">Order: <span style="color:var(--accent)">{{ group.order_number }}</span></div>
+                      <div class="small" style="color:var(--muted)">{{ group.count }} seller code(s)</div>
+                    </div>
+                    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+                      {% for s in group.sources %}
+                        <span class="source-badge">{{ s }}</span>
+                      {% endfor %}
+                    </div>
+                  </div>
+                </summary>
+
+                <div style="padding-top:8px">
+                  <table class="seller-table" role="table" aria-label="Seller rows for {{ group.order_number }}">
+                    <thead>
+                      <tr>
+                        <th style="width:140px">Date</th>
+                        <th>SellerOrderNo</th>
+                        <th style="width:140px">Wallet / Card</th>
+                        <th style="width:160px">Transaction ID</th>
+                        <th style="width:100px">Cashback</th>
+                        <th style="width:100px">Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for r in group.records %}
+                      <tr>
+                        <td>{{ r.date_fmt }}</td>
+                        <td>{{ r.sellerorderno }}</td>
+                        <td>{{ r.wallet_number or r.card_number or '-' }}</td>
+                        <td>{{ r.transaction_id }}</td>
+                        <td>{{ r.cashback }}</td>
+                        <td>{{ r.amount }}</td>
+                      </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            {% endfor %}
+          {% endif %}
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

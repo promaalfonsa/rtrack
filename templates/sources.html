@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Refund Sources — grouped view</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+      :root{
+        --bg:#f6f8fa;
+        --card:#ffffff;
+        --muted:#6b7280;
+        --accent:#0b5fff;
+        --border:#e6e9ef;
+        --source-bg:#eef2ff;
+      }
+      *{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+      body{margin:0;background:var(--bg);color:#111827;}
+      .layout{display:flex;min-height:100vh;}
+      .sidebar{width:220px;background:#ffffff;border-right:1px solid var(--border);padding:18px;box-shadow:0 4px 14px rgba(15,23,42,0.03)}
+      .sidebar h2{margin:0 0 12px 0;font-size:16px;font-weight:800}
+      .side-list{display:flex;flex-direction:column;gap:8px;overflow:auto;max-height:calc(100vh - 120px);}
+      .side-item{padding:10px 12px;border-radius:8px;cursor:pointer;color:#0b355f;font-weight:700;border:1px solid transparent;text-decoration:none;display:block}
+      .side-item.active{background:linear-gradient(90deg, rgba(11,95,255,0.06), transparent);border-color:var(--accent)}
+      .main{flex:1;padding:28px;}
+      .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+      .mini-input{padding:10px;border-radius:8px;border:1px solid var(--border);min-width:240px}
+      .btn{background:var(--accent);color:white;padding:8px 12px;border-radius:8px;border:none;font-weight:700;cursor:pointer}
+      .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:14px;box-shadow:0 6px 18px rgba(15,23,42,0.04)}
+      .order-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+      .order-title{font-weight:700;color:#0b355f}
+      .seller-table{width:100%;border-collapse:collapse}
+      .seller-table th, .seller-table td{padding:10px;border-bottom:1px solid #eef0f3;text-align:left;font-size:13px}
+      .seller-table th{background:#fbfdff;color:#0b355f;border-bottom:2px solid var(--border);font-weight:700}
+      .source-badge{display:inline-block;padding:6px 10px;border-radius:8px;background:var(--source-bg);color:#0b3a99;font-weight:700;font-size:12px}
+      .no-data{color:var(--muted);padding:24px;text-align:center}
+      .last-updated{font-size:13px;color:var(--muted)}
+      @media (max-width:900px){
+        .sidebar{display:none}
+        .mini-input{min-width:160px}
+        .layout{flex-direction:column}
+        .main{padding:16px}
+      }
+    </style>
+    <script>
+      function showSource(name) {
+        document.querySelectorAll('.side-item').forEach(el => el.classList.remove('active'));
+        const sel = document.querySelector('.side-item[data-source="'+name+'"]');
+        if (sel) sel.classList.add('active');
+        document.querySelectorAll('.source-pane').forEach(p => p.style.display = 'none');
+        const pane = document.getElementById('pane-' + name);
+        if (pane) pane.style.display = 'block';
+      }
+
+      document.addEventListener('DOMContentLoaded', function(){
+        const active = "{{ active_source|default('') }}";
+        if (active) {
+          const sel = document.querySelector('.side-item[data-source="'+active+'"]');
+          if (sel) sel.classList.add('active');
+          document.querySelectorAll('.source-pane').forEach(p => p.style.display = 'none');
+          const pane = document.getElementById('pane-' + active);
+          if (pane) pane.style.display = 'block';
+        } else {
+          const first = document.querySelector('.side-item');
+          if (first) {
+            first.classList.add('active');
+            const name = first.dataset.source;
+            const pane = document.getElementById('pane-' + name);
+            if (pane) pane.style.display = 'block';
+          }
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar" aria-label="Sources">
+        <h2>Sources</h2>
+        <div class="side-list" role="tablist">
+          {% for name in source_names %}
+            <a class="side-item {% if active_source==name %}active{% endif %}" data-source="{{ name }}" href="{{ url_for('sources_view') }}?source={{ name }}">{{ name }}</a>
+          {% endfor %}
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="header">
+          <div>
+            <h1 style="margin:0;font-size:20px">All Refund Data</h1>
+            <div class="small">Grouped by order for easier inspection</div>
+          </div>
+          <div>
+            <a href="{{ url_for('index') }}" class="small">← Home</a>
+          </div>
+        </div>
+
+        <!-- panes -->
+        {% for name in source_names %}
+          <div id="pane-{{ name }}" class="source-pane" style="display:none; margin-top:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+              <div>
+                <div style="font-weight:700">{{ name }} — {{ grouped_by_source[name]|length if grouped_by_source.get(name) else 0 }} order(s)</div>
+                <div class="last-updated">
+                  {% if last_updated and last_updated.get(name) %}
+                    Last updated: {{ (last_updated.get(name) | int) | timestamp_to_string }}
+                  {% else %}
+                    Last updated: -
+                  {% endif %}
+                </div>
+              </div>
+
+              <div style="display:flex;gap:8px;align-items:center">
+                <!-- Server-side search only -->
+                <form action="{{ url_for('sources_view') }}" method="get" style="display:inline-flex;gap:6px;align-items:center;">
+                  <input type="hidden" name="source" value="{{ name }}" />
+                  <input name="query" placeholder="Search server-side..." style="padding:8px;border-radius:8px;border:1px solid var(--border)" />
+                  <button class="btn" type="submit">Search</button>
+                </form>
+              </div>
+            </div>
+
+            {% if (grouped_by_source.get(name) is not defined) or grouped_by_source[name]|length == 0 %}
+              <div class="no-data">No data for {{ name }} (remote fetch may have failed and no cache exists)</div>
+            {% else %}
+              {% for group in grouped_by_source[name] %}
+                <div class="card" aria-labelledby="order-{{ loop.index }}-{{ name }}">
+                  <div class="order-header">
+                    <div>
+                      <div id="order-{{ loop.index }}-{{ name }}" class="order-title">Order: <span style="color:var(--accent);">{{ group.order_number }}</span></div>
+                      <div class="order-meta small" style="color:var(--muted)">{{ group.count }} seller code(s)</div>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center">
+                      <button class="btn" onclick="(function(p){ const b=p.querySelector('.seller-body'); b.style.display=(b.style.display==='none'?'':'none'); })(this.closest('.card'))">Toggle</button>
+                      <span class="source-badge">{{ name }}</span>
+                    </div>
+                  </div>
+
+                  <div class="seller-body">
+                    <table class="seller-table" aria-label="Seller rows for {{ group.order_number }}">
+                      <thead>
+                        <tr>
+                          <th style="width:120px">Date</th>
+                          <th>SellerOrderNo</th>
+                          <th style="width:140px">Wallet / Card</th>
+                          <th style="width:120px">Transaction ID</th>
+                          <th style="width:100px">Cashback</th>
+                          <th style="width:100px">Amount</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {% for r in group.records %}
+                          <tr>
+                            <td>{{ r.date_fmt }}</td>
+                            <td>{{ r.sellerorderno }}</td>
+                            <td>{% if r.wallet_number %}{{ r.wallet_number }}{% elif r.card_number %}{{ r.card_number }}{% else %}-{% endif %}</td>
+                            <td>{{ r.transaction_id or '' }}</td>
+                            <td>{{ r.cashback or '' }}</td>
+                            <td>{{ r.amount or '' }}</td>
+                          </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              {% endfor %}
+            {% endif %}
+          </div>
+        {% endfor %}
+      </main>
+    </div>
+  </body>
+</html>
