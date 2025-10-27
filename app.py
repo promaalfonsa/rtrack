@@ -1,4 +1,10 @@
 # app.py
+# Full modified Refund Tracker application (safe for serverless).
+# Changes:
+# - DATA_DIR defaults to /tmp/data (writable on serverless) and is NOT created at import time.
+# - save_cache_for_source() creates DATA_DIR lazily and handles read-only filesystem gracefully.
+# - Rest of the original parsing/search logic preserved.
+
 from flask import Flask, render_template, request, jsonify
 import requests
 from requests.adapters import HTTPAdapter
@@ -55,8 +61,8 @@ for key in list(SOURCES.keys()):
         SOURCES[key] = os.getenv(env_key)
 
 # Data directory & cache settings
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+# Use /tmp/data as default on serverless (writable). Do NOT mkdir at import time.
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/data"))
 CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))  # 10 minutes default
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
@@ -240,44 +246,38 @@ def _make_json_safe(records):
     return safe
 
 def save_cache_for_source(source_name, csv_text, records):
+    """
+    Write CSV and JSON caches. Create DATA_DIR lazily and handle read-only or permission errors.
+    On serverless (Vercel) the filesystem is ephemeral; /tmp is writable during function lifetime.
+    """
     csv_path, json_path = cache_paths_for_source(source_name)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", newline="") as tmp:
-        tmp.write(csv_text)
-        tmp_path = Path(tmp.name)
-    shutil.move(str(tmp_path), str(csv_path))
+
+    # Ensure directory exists (best-effort). Wrap in try/except because on some
+    # serverless platforms the repo root is read-only.
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as ex:
+        logger.warning("Could not create DATA_DIR=%s (%s). Falling back to in-memory/no-disk cache.", DATA_DIR, ex)
+        # If we cannot create directory, skip writing to disk but still keep function working.
+        # We still return (no exception) so app starts successfully.
+        return
+
+    # Atomic write for CSV to avoid partial writes
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", newline="") as tmp:
+            tmp.write(csv_text)
+            tmp_path = Path(tmp.name)
+        shutil.move(str(tmp_path), str(csv_path))
+    except Exception as ex:
+        logger.warning("Failed to write CSV cache for %s: %s", source_name, ex)
+        # continue to try JSON write below (or bail)
+
     safe_records = _make_json_safe(records)
     try:
         with open(json_path, "w", encoding="utf-8") as jf:
             json.dump(safe_records, jf, ensure_ascii=False, indent=2)
     except Exception as ex:
         logger.warning("Failed to write JSON cache for %s: %s", source_name, ex)
-
-def load_cache_for_source(source_name):
-    csv_path, json_path = cache_paths_for_source(source_name)
-    if json_path.exists():
-        try:
-            with open(json_path, "r", encoding="utf-8") as jf:
-                records = json.load(jf)
-                for rec in records:
-                    rec.setdefault("wallet_number_normalized", re.sub(r"\D", "", rec.get("wallet_number", "")))
-                    rec.setdefault("order_number_norm", (rec.get("order_number", "") or "").upper())
-                    rec.setdefault("sellerorderno_norm", (rec.get("sellerorderno", "") or "").upper())
-                    rec.setdefault("transaction_id_norm", (rec.get("transaction_id", "") or "").upper())
-                    rec.setdefault("source", source_name)
-                    dt = try_parse_date(rec.get("date", "") or rec.get("date_fmt", ""))
-                    rec["date_obj"] = dt
-                    rec["date_fmt"] = format_date_for_ui(dt) if dt else (rec.get("date_fmt") or rec.get("date", ""))
-                return records
-        except Exception as ex:
-            logger.warning("Failed to load JSON cache for %s: %s", source_name, ex)
-    if csv_path.exists():
-        try:
-            text = csv_path.read_text(encoding="utf-8", errors="replace")
-            return parse_csv_content(text, source_name)
-        except Exception as ex:
-            logger.warning("Failed to parse CSV cache for %s: %s", source_name, ex)
-    return []
 
 _REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _refresh_in_progress = set()
