@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fetch CSV sources, parse to records, write JSON files under data/.
-This script is used by GitHub Actions (update-data workflow) to update data/*.json.
+This script can be run manually on the server to update cached data files.
 Fixed: avoid backslashes in f-string expressions by computing safe_name separately.
 """
 import requests
